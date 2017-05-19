@@ -173,7 +173,7 @@ function MatrixClient(opts) {
     }
     this._syncingRetry = null;
     this._syncApi = null;
-    this._websocket = null;
+    this._websocketApi = null;
     this._peekSync = null;
     this._isGuest = false;
     this._ongoingScrollbacks = {};
@@ -3134,6 +3134,7 @@ MatrixClient.prototype.stopClient = function() {
  * Called by WebSocketAPI to fallback to Longpolling (SyncAPI)
  */
 MatrixClient.prototype.connectionFallback = function(opts) {
+    this.useWebSockets = false;
     console.log("Do Fallback to SyncAPI");
     this._syncApi = new SyncApi(this, opts);
     this._syncApi.sync();
