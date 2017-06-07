@@ -1550,6 +1550,9 @@ MatrixClient.prototype.sendTyping = function(roomId, isTyping, timeoutMs, callba
         return Promise.resolve({}); // guests cannot send typing notifications so don't bother.
     }
 
+    if (this.useWebSockets && this._websocketApi) {
+        return this._websocketApi.sendTyping(roomId, isTyping, timeoutMs, callback)
+    }
     const path = utils.encodeUri("/rooms/$roomId/typing/$userId", {
         $roomId: roomId,
         $userId: this.credentials.userId,
