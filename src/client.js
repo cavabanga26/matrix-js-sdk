@@ -108,7 +108,7 @@ try {
  * 
  * @param {boolean} opts.useWebSocket Optional. Set to false to prefer SyncAPI (long
  * polling) to WebSocketAPI. If not set WebSocketApi will be prefered.
- * Note: There is a fallback to SyncAPI if WebSocketAPI does not work)
+ * Note: There is a fallback to SyncAPI if WebSocketAPI does not work
  *
  * @param {boolean} [opts.timelineSupport = false] Set to true to enable
  * improved timeline support ({@link
@@ -1133,7 +1133,6 @@ MatrixClient.prototype.sendEvent = function(roomId, eventType, content, txnId,
 // adds the event to the queue, or sends it
 // marks the event as sent/unsent
 // returns a promise which resolves with the result of the send request
-// TODO: Implement usage of WebSocketApi
 function _sendEvent(client, room, event, callback) {
     // Add an extra Promise.resolve() to turn synchronous exceptions into promise rejections,
     // so that we can handle synchronous and asynchronous exceptions with the
@@ -1166,7 +1165,6 @@ function _sendEvent(client, room, event, callback) {
         }
 
         if (!promise) {
-            //TODO Use WebSocketAPI
             if (client.useWebSockets) {
                 promise = client._websocketApi.sendEvent(event);
             }
@@ -1499,7 +1497,7 @@ MatrixClient.prototype.setRoomReadMarkers = function(roomId, eventId, rrEvent) {
     }
 
     if (this.useWebSockets && this._websocketApi) {
-        return this._websocketApi.sendReadMarkers(roomId, rmEventId, rrEventId)
+        return this._websocketApi.sendReadMarkers(roomId, rmEventId, rrEventId);
     }
     return this.setRoomReadMarkersHttpRequest(roomId, rmEventId, rrEventId);
 };
@@ -1554,7 +1552,7 @@ MatrixClient.prototype.sendTyping = function(roomId, isTyping, timeoutMs, callba
     }
 
     if (this.useWebSockets && this._websocketApi) {
-        return this._websocketApi.sendTyping(roomId, isTyping, timeoutMs, callback)
+        return this._websocketApi.sendTyping(roomId, isTyping, timeoutMs, callback);
     }
     const path = utils.encodeUri("/rooms/$roomId/typing/$userId", {
         $roomId: roomId,
@@ -3161,6 +3159,7 @@ MatrixClient.prototype.stopClient = function() {
 
 /**
  * Called by WebSocketApi to fallback to Longpolling (SyncAPI)
+ * @param {Object} opts the same Object as defined for SyncApi or WebSocketApi
  */
 MatrixClient.prototype.connectionFallback = function(opts) {
     this.useWebSockets = false;
