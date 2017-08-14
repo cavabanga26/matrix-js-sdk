@@ -174,6 +174,7 @@ function MatrixClient(opts) {
     this._syncingRetry = null;
     this._syncApi = null;
     this._websocketApi = null;
+    this.useWebSockets = Boolean(opts.useWebSockets);
     this._peekSync = null;
     this._isGuest = false;
     this._ongoingScrollbacks = {};
@@ -181,10 +182,6 @@ function MatrixClient(opts) {
     this.urlPreviewCache = {};
     this._notifTimelineSet = null;
 
-    this.useWebSockets = true;
-    if (opts.useWebSockets) {
-        this.useWebSockets = Boolean(opts.useWebSockets);
-    }
 
     this._crypto = null;
     this._cryptoStore = opts.cryptoStore;
