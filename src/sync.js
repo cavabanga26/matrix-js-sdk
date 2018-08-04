@@ -480,21 +480,14 @@ SyncApi.prototype.sync = function() {
             self._currentSyncRequest = self._doSyncRequest({ filterId }, savedSyncToken);
         }
 
+        // Now wait for the saved sync to finish...
         await savedSyncPromise;
-        if (USE_WEBSOCKET) {
-            self._websocket({ filterId: filterId });
-        } else {
-            self._sync({ filterId: filterId });
-        }
+        self._sync({ filterId });
     }
 
     if (client.isGuest()) {
         // no push rules for guests, no access to POST filter for guests.
-        if (USE_WEBSOCKET) {
-            self._websocket({});
-        } else {
-            self._sync({});
-        }
+        self._sync({});
     } else {
         // Pull the saved sync token out first, before the worker starts sending
         // all the sync data which could take a while. This will let us send our

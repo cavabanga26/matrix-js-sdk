@@ -1,6 +1,7 @@
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 Copyright 2017 Vector Creations Ltd
+Copyright 2018 New Vector Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,11 +37,11 @@ function getFilterName(userId, suffix) {
     return "FILTER_SYNC_" + userId + (suffix ? "_" + suffix : "");
 }
 
-function debuglog() {
+function debuglog(...params) {
     if (!DEBUG) {
         return;
     }
-    console.log(...arguments);
+    console.log(...params);
 }
 
 
@@ -127,26 +128,31 @@ WebSocketApi.prototype.start = function() {
         global.document.addEventListener("online", this._onOnlineBound, false);
     }
 
+    let savedSyncPromise = Promise.resolve();
+
     // We need to do one-off checks before we can begin the /sync loop.
     // These are:
     //   1) We need to get push rules so we can check if events should bing as we get
     //      them from /sync.
     //   2) We need to get/create a filter which we can use for /sync.
 
-    function getPushRules() {
-        client.getPushRules().done((result) => {
+    async function getPushRules() {
+        try {
+            const result = await client.getPushRules();
             debuglog("Got push rules");
+
             client.pushRules = result;
-            getFilter(); // Now get the filter and start syncing
-        }, function(err) {
-            client._syncApi._startKeepAlives().done(function() {
-                getPushRules();
-            });
-            self._updateSyncState("ERROR", { error: err });
-        });
+        } catch (err) {
+            // wait for saved sync to complete before doing anything else,
+            // otherwise the sync state will end up being incorrect
+            await client._syncApi.recoverFromSyncStartupError(savedSyncPromise, err);
+            getPushRules();
+            return;
+        }
+        getFilter(); // Now get the filter and start syncing
     }
 
-    function getFilter() {
+    async function getFilter() {
         let filter;
         if (self.opts.filter) {
             filter = self.opts.filter;
@@ -155,40 +161,46 @@ WebSocketApi.prototype.start = function() {
             filter.setTimelineLimit(self.opts.initialSyncLimit);
         }
 
-        client.getOrCreateFilter(
-            getFilterName(client.credentials.userId), filter,
-        ).done((filterId) => {
-            // reset the notifications timeline to prepare it to paginate from
-            // the current point in time.
-            // The right solution would be to tie /sync pagination tokens into
-            // /notifications API somehow.
-            client.resetNotifTimelineSet();
+        let filterId;
+        try {
+            filterId = await client.getOrCreateFilter(
+                getFilterName(client.credentials.userId), filter,
+            );
+        } catch (err) {
+            // wait for saved sync to complete before doing anything else,
+            // otherwise the sync state will end up being incorrect
+            await self.recoverFromSyncStartupError(savedSyncPromise, err);
+            getFilter();
+            return;
+        }
+        // reset the notifications timeline to prepare it to paginate from
+        // the current point in time.
+        // The right solution would be to tie /sync pagination tokens into
+        // /notifications API somehow.
+        client.resetNotifTimelineSet();
 
-            self._start({ filterId });
-        }, function(err) {
-            client._syncApi._startKeepAlives().done(function() {
-                getFilter();
-            });
-            self._updateSyncState("ERROR", { error: err });
-        });
+        await savedSyncPromise;
+        self._start({ filterId });
     }
 
     if (client.isGuest()) {
         // no push rules for guests, no access to POST filter for guests.
         self._start({});
     } else {
-        // Before fetching push rules, fetching the filter and syncing, check
-        // for persisted /sync data and use that if present.
-        client.store.getSavedSync().then((savedSync) => {
+        // Pull the saved sync token out first, before the worker starts sending
+        // all the sync data which could take a while. This will let us send our
+        // first incremental sync request before we've processed our saved data.
+        savedSyncPromise = client.store.getSavedSyncToken().then((tok) => {
+            return client.store.getSavedSync();
+        }).then((savedSync) => {
             if (savedSync) {
                 return client._syncApi._syncFromCache(savedSync);
             }
-        }).then(() => {
-            // Get push rules and start syncing after getting the saved sync
-            // to handle the case where we needed the `nextBatch` token to
-            // start syncing from.
-            getPushRules();
         });
+        // Now start the first incremental sync request: this can also
+        // take a while so if we set it going now, we can wait for it
+        // to finish while we process our saved sync data.
+        getPushRules();
     }
 };
 
@@ -283,7 +295,7 @@ WebSocketApi.prototype.stop = function() {
         this._websocket.close();
         this._websocket = null;
     }
-    this._updateSyncState("STOPPED");
+    this.client._syncApi._updateSyncState("STOPPED");
 };
 
 /**
@@ -296,61 +308,36 @@ WebSocketApi.prototype.stop = function() {
 WebSocketApi.prototype._start = async function(syncOptions) {
     const client = this.client;
     const self = this;
+    // store syncOptions to be there for restart
+    self.ws_syncOptions = syncOptions;
 
     if (!this._running) {
         debuglog("WebSocket no longer running: exiting.");
-        this._updateSyncState("STOPPED");
+        client._syncApi._updateSyncState("STOPPED");
         return;
-    }
-
-    let filterId = syncOptions.filterId;
-    if (client.isGuest() && !filterId) {
-        filterId = client._syncApi._getGuestFilter();
     }
 
     // as the syncToken has to be present for the websocket (which run async)
     // we store it not just function-wide
     self.ws_syncToken = client.store.getSyncToken();
 
-    const qps = {
-        filter: filterId,
-    };
+    const qps = client._syncApi._getSyncParams(syncOptions, self.ws_syncToken);
 
-    if (this.opts.disablePresence) {
-        qps.set_presence = "offline";
-    }
+    // We don't need the timeout for websocket
+    delete qps.timeout;
 
-    // store syncOptions to be there for restart
-    self.ws_syncOptions = syncOptions;
+    // we are currently reconnecting
+    this._start_websocket(qps);
+};
 
-    if (self.ws_syncToken) {
-        // we are currently reconnecting
-        this._start_websocket(qps);
-        return;
-    }
-
-    // the initial sync might take some more time as the
-    // websocket might have to respond. To avoid a connection loss
-    // especially on low throughput devices we offload this to a
-    // dedicated sync request
-
-    let data;
-    try {
-        //debuglog('Starting sync since=' + syncToken);
-        this._currentSyncRequest = client._http.authedRequest(
-            undefined, "GET", "/sync", qps, undefined, this.opts.pollTimeout,
-        );
-        data = await this._currentSyncRequest;
-    } catch (e) {
-        client._syncApi._startKeepAlives().done(() => {
-            debuglog("Starting with initial sync failed (", e, "). Retries");
-            this._start(syncOptions);
-        });
-        return;
-    }
-
-    // NOTE: The following code is just to handle the initial sync
-    //       When initial sync is done via websocket as well that part is not needed
+/**
+ * handle message from server which was identified to be a /sync-response
+ * @param {Object} data Object that contains the /sync-response
+ */
+WebSocketApi.prototype.handleSync = async function(data) {
+    const client = this.client;
+    const self = this;
+    //debuglog('Got new data from socket, next_batch=' + data.next_batch);
 
     // set the sync token NOW *before* processing the events. We do this so
     // if something barfs on an event we can skip it rather than constantly
@@ -376,19 +363,19 @@ WebSocketApi.prototype._start = async function(syncOptions) {
         await client._syncApi._processSyncResponse(
             syncEventData, data,
         );
-    } catch (e) {
+    } catch(e) {
         // log the exception with stack if we have it, else fall back
         // to the plain description
-        console.error("Caught /sync error", e.stack || e);
+        console.error("Caught /sync error (via WebSocket)", e.stack || e);
     }
 
+    // update this as it may have changed
+    syncEventData.catchingUp = false;
 
     if (!this.ws_syncOptions.hasSyncedBefore) {
-        this._updateSyncState("PREPARED", syncEventData);
+        client._syncApi._updateSyncState("PREPARED", syncEventData);
         this.ws_syncOptions.hasSyncedBefore = true;
     }
-
-    this.ws_syncToken = data.next_batch;
 
     // tell the crypto module to do its processing. It may block (to do a
     // /keys/changes request).
@@ -397,18 +384,28 @@ WebSocketApi.prototype._start = async function(syncOptions) {
     }
 
     // keep emitting SYNCING -> SYNCING for clients who want to do bulk updates
-    this._updateSyncState("SYNCING", syncEventData);
+    client._syncApi._updateSyncState("SYNCING", syncEventData);
 
-    // tell databases that everything is now in a consistent state and can be saved.
-    client.store.save();
 
-    // the initial sync now went through. Now start using the websocket
-    this._start_websocket(qps);
+    if (client.store.wantsSave()) {
+        // We always save the device list (if it's dirty) before saving the sync data:
+        // this means we know the saved device list data is at least as fresh as the
+        // stored sync data which means we don't have to worry that we may have missed
+        // device changes. We can also skip the delay since we're not calling this very
+        // frequently (and we don't really want to delay the sync for it).
+        if (this.opts.crypto) {
+            await this.opts.crypto.saveDeviceList(0);
+        }
+
+        // tell databases that everything is now in a consistent state and can be saved.
+        client.store.save();
+    }
+
+    self.ws_syncToken = data.next_batch;
 };
 
 WebSocketApi.prototype._start_websocket = function(qps) {
     const self = this;
-    qps.since = this.ws_syncToken;
     this._websocket = this.client._http.generateWebSocket(qps);
     this._websocket.onopen = _onopen;
     this._websocket.onclose = _onclose;
@@ -446,7 +443,7 @@ WebSocketApi.prototype._start_websocket = function(qps) {
         if (self.ws_possible) {
             // assume connection to websocket lost by mistake
             debuglog("Reinit Connection via WebSocket");
-            self._updateSyncState("RECONNECTING");
+            self.client._syncApi._updateSyncState("RECONNECTING");
             self.client._syncApi._startKeepAlives().done(function() {
                 debuglog("Restart Websocket");
                 self._start(self.ws_syncOptions);
@@ -527,44 +524,6 @@ WebSocketApi.prototype.handleResponse = function(response) {
         console.error("response does not contain result nor error", response);
         return false;
     }
-};
-
-/**
- * handle message from server which was identified to be a /sync-response
- * @param {Object} data Object that contains the /sync-response
- */
-WebSocketApi.prototype.handleSync = async function(data) {
-    const client = this.client;
-    const self = this;
-    //debuglog('Got new data from socket, next_batch=' + data.next_batch);
-
-    // set the sync token NOW *before* processing the events. We do this so
-    // if something barfs on an event we can skip it rather than constantly
-    // polling with the same token.
-    client.store.setSyncToken(data.next_batch);
-
-    await client.store.setSyncData(data);
-    try {
-        client._syncApi._processSyncResponse(self.ws_syncToken, data, false);
-    } catch(e) {
-        // log the exception with stack if we have it, else fall back
-        // to the plain description
-        console.error("Caught /sync error (via WebSocket)", e.stack || e);
-    }
-
-    // emit synced events
-    const syncEventData = {
-        oldSyncToken: self.ws_syncToken,
-        nextSyncToken: data.next_batch,
-    };
-
-    self._updateSyncState("SYNCING", syncEventData);
-
-    // tell databases that everything is now in a consistent state and can be
-    // saved (no point doing so if we only have the data we just got out of the
-    // store).
-    client.store.save();
-    self.ws_syncToken = data.next_batch;
 };
 
 WebSocketApi.prototype.sendObject = function(message) {
@@ -713,17 +672,6 @@ WebSocketApi.prototype.sendTyping = function(roomId, isTyping, timeoutMs, callba
     }
 
     return this.sendObject(message);
-};
-
-/**
- * Sets the sync state and emits an event to say so
- * @param {String} newState The new state string
- * @param {Object} data Object of additional data to emit in the event
- */
-WebSocketApi.prototype._updateSyncState = function(newState, data) {
-    const old = this._syncState;
-    this._syncState = newState;
-    this.client.emit("sync", this._syncState, old, data);
 };
 
 /**

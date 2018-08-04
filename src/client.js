@@ -105,7 +105,7 @@ try {
  *
  * @param {boolean} [opts.useAuthorizationHeader = false] Set to true to use
  * Authorization header instead of query param to send the access token to the server.
- * 
+ *
  * @param {boolean} opts.useWebSockets Optional. Set to false to prefer SyncAPI (long
  * polling) to WebSocketAPI. If not set WebSocketApi will be prefered.
  * Note: There is a fallback to SyncAPI if WebSocketAPI does not work
@@ -181,7 +181,6 @@ function MatrixClient(opts) {
     this.timelineSupport = Boolean(opts.timelineSupport);
     this.urlPreviewCache = {};
     this._notifTimelineSet = null;
-
 
     this._crypto = null;
     this._cryptoStore = opts.cryptoStore;
@@ -1155,9 +1154,6 @@ function _sendEvent(client, room, event, callback) {
         }
 
         if (!promise) {
-            if (client.useWebSockets && client._websocketApi) {
-                promise = client._websocketApi.sendEvent(event);
-            }
             promise = _sendEventHttpRequest(client, event);
         }
         return promise;
@@ -1239,6 +1235,9 @@ function _updatePendingEventStatus(room, event, newStatus) {
 }
 
 function _sendEventHttpRequest(client, event) {
+    if (client.useWebSockets && client._websocketApi) {
+        return client._websocketApi.sendEvent(event);
+    }
     const txnId = event._txnId ? event._txnId : client.makeTxnId();
 
     const pathParams = {
@@ -3100,16 +3099,6 @@ MatrixClient.prototype.startClient = function(opts) {
     if (this.useWebSockets) {
         this._websocketApi = new WebSocketApi(this, opts);
         this._websocketApi.start();
-
-        const self = this;
-        this.scheduler.setProcessFunction(function(eventToSend) {
-            const room = self.getRoom(eventToSend.getRoomId());
-            if (eventToSend.status !== EventStatus.SENDING) {
-                _updatePendingEventStatus(room, eventToSend,
-                                          EventStatus.SENDING);
-            }
-            return self._websocketApi.sendEvent(eventToSend);
-        });
     } else {
         this._syncApi.sync();
     }
@@ -3161,19 +3150,9 @@ MatrixClient.prototype.connectionFallback = function(opts, syncOptions) {
         global.document.addEventListener("online", sync._onOnlineBound, false);
     }
 
-    sync._sync(syncOptions);
     this._websocketApi.stop();
     this._websocketApi = null;
-
-    const self = this;
-    this.scheduler.setProcessFunction(function(eventToSend) {
-        const room = self.getRoom(eventToSend.getRoomId());
-        if (eventToSend.status !== EventStatus.SENDING) {
-            _updatePendingEventStatus(room, eventToSend,
-                                        EventStatus.SENDING);
-        }
-        return _sendEventHttpRequest(self, eventToSend);
-    });
+    sync._sync(syncOptions);
 };
 
 /*
